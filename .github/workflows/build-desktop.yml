@@ -689,6 +689,37 @@ jobs:
               --notes-file release-notes.md
           fi
 
+      - name: Prune old releases (keep latest 5)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+          RELEASE_REPOSITORY: SimonChenX/jyaiwork-release
+          SOURCE_REPOSITORY: SimonChenX/JYAI_WorK_Client
+          RELEASE_KEEP: "5"
+        run: |
+          set -euo pipefail
+          keep="${{ env.RELEASE_KEEP }}"
+          versioned_tags() {
+            gh api "repos/$1/releases?per_page=100" --paginate \
+              --jq '.[] | select(.draft | not) | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | .tag_name'
+          }
+          prune() {  # prune <repo> <cleanup-tags: yes|no>
+            local repo="$1" cleanup="$2" doomed=()
+            mapfile -t doomed < <(versioned_tags "$repo" | sort -Vr | tail -n "+$((keep + 1))")
+            for tag in "${doomed[@]:-}"; do
+              [ -n "$tag" ] || continue
+              echo "  ✗ 清理旧版本 $repo/$tag"
+              if [ "$cleanup" = "yes" ]; then
+                gh release delete "$tag" --repo "$repo" --yes --cleanup-tag
+              else
+                gh release delete "$tag" --repo "$repo" --yes
+              fi
+            done
+          }
+          echo "== 保留策略：只保留最新 $keep 个版本 =="
+          prune "$RELEASE_REPOSITORY" yes
+          prune "$SOURCE_REPOSITORY" no
+
       - name: Remove temporary draft after successful publication
         shell: bash
         env:
