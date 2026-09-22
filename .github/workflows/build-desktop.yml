@@ -71,7 +71,7 @@ jobs:
           set -euo pipefail
 
           if [ -z "$GH_TOKEN" ]; then
-            echo "::error::Missing RELEASE_REPO_TOKEN. Grant the token Contents read/write access to $RELEASE_REPOSITORY."
+            echo "::error::Missing WORKFLOW_PAT. Grant the token Contents read/write access to $RELEASE_REPOSITORY (and to the private source repository for checkout)."
             exit 1
           fi
 
@@ -86,11 +86,11 @@ jobs:
           # 允许私有产物仓（2026-09-18 起实际就是私有）：对外下载统一走技术部官网下载页，
           # 安装包由发布脚本用 token 拉取后落本站，GitHub 侧不需要公开可见。
           if [ "$repositoryVisibility" != "public" ]; then
-            echo "::notice::$RELEASE_REPOSITORY is $repositoryVisibility; assets stay behind RELEASE_REPO_TOKEN and are mirrored to the official download page."
+            echo "::notice::$RELEASE_REPOSITORY is $repositoryVisibility; installers are published here and mirrored to the source repository release, then to the official download page."
           fi
 
           if [ "$canPush" != "true" ]; then
-            echo "::error::RELEASE_REPO_TOKEN cannot publish to $RELEASE_REPOSITORY"
+            echo "::error::WORKFLOW_PAT cannot publish to $RELEASE_REPOSITORY"
             exit 1
           fi
 
