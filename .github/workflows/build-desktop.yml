@@ -1,0 +1,698 @@
+# JYAI Work 客户端安装包构建（**主口径：跑在公开产物仓 SimonChenX/jyaiwork-release**）
+# 为什么在这里跑：GitHub Actions 对公开仓的标准托管 runner 免费；私有仓走账号额度（Free 2,000 分钟/月，
+#   macOS 单价约 Linux 的 10 倍），额度耗尽后作业直接起不来（runner_id=0）。
+# 必需的仓库 secret：WORKFLOW_PAT —— 需同时具备
+#   ① JYAI_WorK_Client 的 contents:read（checkout 私有源码）
+#   ② JYAI_WorK_Client 的 contents:write（把安装包镜像到源码仓 Release）
+#   ③ jyaiwork-release 的 contents:write（草稿/发布）
+# 触发：workflow_dispatch，platform 默认 win-mac（Windows x64 + macOS arm64 两个作业），
+#   macos-x64 / linux / all 手动选；source_ref 选源码仓的分支/标签/SHA（默认 main）。
+name: Build JYAIWork Desktop Installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Desktop installer platform (default win-mac = Windows x64 + macOS arm64; others on demand)
+        required: true
+        type: choice
+        default: win-mac
+        options:
+          - win-mac
+          - all
+          - windows
+          - macos
+          - macos-x64
+          - linux
+      source_ref:
+        description: JYAI_WorK_Client ref (branch/tag/SHA) to build
+        required: true
+        type: string
+        default: main
+      vite_app_base_url:
+        description: JYAI backend base URL embedded by Vite
+        required: true
+        type: string
+        default: https://work.internal.jiayouexp.com/api
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-jyaiwork-desktop-${{ github.ref }}-${{ inputs.platform }}
+  cancel-in-progress: true
+
+jobs:
+  prepare-release:
+    name: Validate public release configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      target_branch: ${{ steps.metadata.outputs.target_branch }}
+      matrix: ${{ steps.targets.outputs.matrix }}
+      staging_tag: ${{ steps.staging.outputs.tag }}
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: SimonChenX/JYAI_WorK_Client
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.WORKFLOW_PAT }}
+
+      - name: Validate release repository and version
+        id: metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+          RELEASE_REPOSITORY: SimonChenX/jyaiwork-release
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Missing RELEASE_REPO_TOKEN. Grant the token Contents read/write access to $RELEASE_REPOSITORY."
+            exit 1
+          fi
+
+          repositoryInfo="$(gh api "repos/$RELEASE_REPOSITORY" --jq '[.full_name, .visibility, .default_branch, .permissions.push] | @tsv')"
+          IFS=$'\t' read -r repositoryName repositoryVisibility targetBranch canPush <<< "$repositoryInfo"
+
+          if [ "$repositoryName" != "$RELEASE_REPOSITORY" ]; then
+            echo "::error::Release repository mismatch: $repositoryName"
+            exit 1
+          fi
+
+          # 允许私有产物仓（2026-09-18 起实际就是私有）：对外下载统一走技术部官网下载页，
+          # 安装包由发布脚本用 token 拉取后落本站，GitHub 侧不需要公开可见。
+          if [ "$repositoryVisibility" != "public" ]; then
+            echo "::notice::$RELEASE_REPOSITORY is $repositoryVisibility; assets stay behind RELEASE_REPO_TOKEN and are mirrored to the official download page."
+          fi
+
+          if [ "$canPush" != "true" ]; then
+            echo "::error::RELEASE_REPO_TOKEN cannot publish to $RELEASE_REPOSITORY"
+            exit 1
+          fi
+
+          version="$(node -p "require('./package.json').version")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid desktop application version: $version"
+            exit 1
+          fi
+
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+          printf 'target_branch=%s\n' "$targetBranch" >> "$GITHUB_OUTPUT"
+
+      - name: Select desktop build targets
+        id: targets
+        shell: bash
+        env:
+          BUILD_PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+
+          node <<'NODE' >> "$GITHUB_OUTPUT"
+          const targets = {
+            windows: {
+              display_name: "Windows x64 EXE",
+              runner: "windows-2022",
+              target: "x86_64-pc-windows-msvc",
+              package_args: "--win --x64",
+              artifact_path: "dist-electron/jyaiwork-win-x64-*.exe",
+              installer_count: 1,
+            },
+            macos: {
+              display_name: "macOS arm64 DMG",
+              runner: "macos-14",
+              target: "aarch64-apple-darwin",
+              package_args: "--mac --arm64",
+              artifact_path: "dist-electron/jyaiwork-mac-arm64-*.dmg",
+              installer_count: 1,
+              app_dir: "dist-electron/mac-arm64",
+              mach_arch: "arm64",
+            },
+            "macos-x64": {
+              display_name: "macOS x64 DMG",
+              runner: "macos-15-intel",
+              target: "x86_64-apple-darwin",
+              package_args: "--mac --x64",
+              artifact_path: "dist-electron/jyaiwork-mac-x64-*.dmg",
+              installer_count: 1,
+              app_dir: "dist-electron/mac",
+              mach_arch: "x86_64",
+            },
+            linux: {
+              display_name: "Linux x64 AppImage and DEB",
+              runner: "ubuntu-22.04",
+              target: "x86_64-unknown-linux-gnu",
+              package_args: "--linux --x64",
+              artifact_path: "dist-electron/jyaiwork-linux-x86_64-*.AppImage dist-electron/jyaiwork-linux-amd64-*.deb",
+              installer_count: 2,
+            },
+          };
+
+          const platform = process.env.BUILD_PLATFORM;
+          // win-mac = 日常自动发版口径：只打 Windows x64 与 macOS arm64（省 GitHub Actions 额度）；
+          // macos-x64 / linux / all 仍可手动选，用于按需补包。
+          const presets = { all: Object.keys(targets), "win-mac": ["windows", "macos"] };
+          const include = (presets[platform] ?? [platform]).map((key) => targets[key]);
+          if (include.some((target) => !target)) {
+            throw new Error(`Unsupported desktop platform: ${platform}`);
+          }
+
+          process.stdout.write(`matrix=${JSON.stringify({ include })}\n`);
+          NODE
+
+      - name: Prepare temporary draft release
+        id: staging
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+          RELEASE_REPOSITORY: SimonChenX/jyaiwork-release
+          RELEASE_TARGET_BRANCH: ${{ steps.metadata.outputs.target_branch }}
+        run: |
+          set -euo pipefail
+          stagingTag="build-$GITHUB_RUN_ID"
+          # Reuse the draft when retrying failed jobs in this run.
+          if ! gh release view "$stagingTag" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$stagingTag" \
+              --repo "$RELEASE_REPOSITORY" \
+              --target "$RELEASE_TARGET_BRANCH" \
+              --draft \
+              --title "Temporary desktop build $GITHUB_RUN_ID" \
+              --notes "Temporary installer transfer for this build. Not a public release."
+          fi
+          printf 'tag=%s\n' "$stagingTag" >> "$GITHUB_OUTPUT"
+
+  build-desktop:
+    name: Build ${{ matrix.display_name }}
+    needs: prepare-release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-release.outputs.matrix) }}
+
+    env:
+      TARGET: ${{ matrix.target }}
+      VITE_APP_BASE_URL: ${{ inputs.vite_app_base_url }}
+
+    steps:
+      - name: Checkout source repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: SimonChenX/JYAI_WorK_Client
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.WORKFLOW_PAT }}
+
+      - name: Enable Git long paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: git config --global core.longpaths true
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.4.0
+
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@f4d14e03ff726c06358e5557344e1da148b56cf7 # v1
+        with:
+          bun-version: 1.3.10
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      - name: Build Electron app
+        run: pnpm build
+
+      - name: Verify JYAI backend URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! grep -R -F -q \
+            --include='*.html' \
+            --include='*.js' \
+            "$VITE_APP_BASE_URL" \
+            dist; then
+            echo "VITE_APP_BASE_URL was not embedded in the renderer output" >&2
+            exit 1
+          fi
+          echo "Verified VITE_APP_BASE_URL=$VITE_APP_BASE_URL"
+
+      - name: Package Electron installer
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          MACOS_NOTARIZE: "false"
+        run: >-
+          pnpm exec electron-builder
+          --config electron-builder.yml
+          ${{ matrix.package_args }}
+          --publish never
+
+      - name: Verify Windows x64 artifacts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # 主程序名由 electron-builder 的 productName 决定（当前 JYAI），从产物里解析，不写死旧名
+          $appExes = @(Get-ChildItem "dist-electron/win-unpacked/*.exe" -File |
+            Where-Object { $_.Name -notlike "*uninstaller*" -and $_.Name -ne "OpenConsole.exe" })
+          if ($appExes.Count -ne 1) {
+            throw "Expected exactly one packaged application executable, found $($appExes.Count): $($appExes.Name -join ', ')"
+          }
+          $appExe = $appExes[0].FullName
+          Write-Host "Packaged application: $appExe"
+
+          $bytes = [System.IO.File]::ReadAllBytes($appExe)
+          $peOffset = [System.BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [System.BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0x8664) {
+            throw ("Expected x86_64 PE machine 0x8664, got 0x{0:X4}" -f $machine)
+          }
+
+          $appAsar = "dist-electron/win-unpacked/resources/app.asar"
+          $asarCli = Get-ChildItem "node_modules/.pnpm/@electron+asar@*/node_modules/@electron/asar/bin/asar.js" -File |
+            Select-Object -First 1
+          if (-not $asarCli) {
+            throw "Unable to locate the @electron/asar CLI"
+          }
+
+          $asarEntries = @(& node $asarCli.FullName list $appAsar)
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to inspect packaged app.asar"
+          }
+          $normalizedEntries = @($asarEntries | ForEach-Object { ($_ -replace '\\', '/').TrimStart('/') })
+          $requiredLoader = "dist/server/builtin-skills/imagegen.js"
+          if ($normalizedEntries -notcontains $requiredLoader) {
+            throw "Missing built-in Skill loader in app.asar: $requiredLoader"
+          }
+          Write-Host "Verified built-in Skill loader in app.asar: $requiredLoader"
+
+          $installers = @(Get-ChildItem "dist-electron/jyaiwork-win-x64-*.exe")
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Windows x64 installer, found $($installers.Count)"
+          }
+
+          Get-FileHash $installers[0].FullName -Algorithm SHA256
+
+      - name: Verify macOS artifacts
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APP_DIR: ${{ matrix.app_dir }}
+          MACH_ARCH: ${{ matrix.mach_arch }}
+          INSTALLER_PATTERN: ${{ matrix.artifact_path }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          appBundles=("$APP_DIR"/*.app)
+          if [ ${#appBundles[@]} -ne 1 ]; then
+            echo "Expected exactly one macOS $MACH_ARCH app bundle, found ${#appBundles[@]}" >&2
+            exit 1
+          fi
+
+          # 可执行名同样由 productName 决定，从 bundle 里解析（Contents/MacOS 下即为主程序）
+          appBinary="$(find "${appBundles[0]}/Contents/MacOS" -maxdepth 1 -type f -perm -u+x | head -1)"
+          if [ -z "$appBinary" ]; then
+            echo "Unable to locate the main executable in ${appBundles[0]}/Contents/MacOS" >&2
+            exit 1
+          fi
+          echo "Packaged application binary: $appBinary"
+          if [ ! -f "$appBinary" ]; then
+            echo "Missing packaged application binary: $appBinary" >&2
+            exit 1
+          fi
+
+          architectures="$(lipo -archs "$appBinary")"
+          if [ "$architectures" != "$MACH_ARCH" ]; then
+            echo "Expected $MACH_ARCH Mach-O binary, got: $architectures" >&2
+            exit 1
+          fi
+
+          resourcesDir="${appBundles[0]}/Contents/Resources"
+          architectures="$(lipo -archs "$resourcesDir/sidecars/opencode-$TARGET")"
+          if [ "$architectures" != "$MACH_ARCH" ]; then
+            echo "Expected $MACH_ARCH Mach-O binary at opencode sidecar, got: $architectures" >&2
+            exit 1
+          fi
+
+          # 辅助程序为可选组件（resources/helpers 当前为空，extraResources 过滤器只匹配
+          # JYAIWork Computer Use.app）。存在则校验架构，不存在只告警不失败。
+          helperBins=( "$resourcesDir"/helpers/*.app/Contents/MacOS/* )
+          if [ ${#helperBins[@]} -gt 0 ] && [ -f "${helperBins[0]}" ]; then
+            architectures="$(lipo -archs "${helperBins[0]}")"
+            if [ "$architectures" != "$MACH_ARCH" ]; then
+              echo "Expected $MACH_ARCH Mach-O binary at ${helperBins[0]}, got: $architectures" >&2
+              exit 1
+            fi
+          else
+            echo "::warning::未打包 macOS 辅助程序（resources/helpers 为空），跳过其架构校验"
+          fi
+
+          appAsar="${appBundles[0]}/Contents/Resources/app.asar"
+          asarCandidates=(node_modules/.pnpm/@electron+asar@*/node_modules/@electron/asar/bin/asar.js)
+          if [ ${#asarCandidates[@]} -eq 0 ]; then
+            echo "Unable to locate the @electron/asar CLI" >&2
+            exit 1
+          fi
+
+          requiredLoader="dist/server/builtin-skills/imagegen.js"
+          if ! node "${asarCandidates[0]}" list "$appAsar" \
+            | sed 's#\\#/#g; s#^/##' \
+            | grep -F -x "$requiredLoader" >/dev/null; then
+            echo "Missing built-in Skill loader in app.asar: $requiredLoader" >&2
+            exit 1
+          fi
+          echo "Verified built-in Skill loader in app.asar: $requiredLoader"
+
+          installers=($INSTALLER_PATTERN)
+          if [ ${#installers[@]} -ne 1 ]; then
+            echo "Expected exactly one macOS $MACH_ARCH installer, found ${#installers[@]}" >&2
+            exit 1
+          fi
+
+          shasum -a 256 "${installers[0]}"
+
+      - name: Verify Linux x64 artifacts
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          appAsar="dist-electron/linux-unpacked/resources/app.asar"
+          asarCandidates=(node_modules/.pnpm/@electron+asar@*/node_modules/@electron/asar/bin/asar.js)
+          if [ ${#asarCandidates[@]} -eq 0 ]; then
+            echo "Unable to locate the @electron/asar CLI" >&2
+            exit 1
+          fi
+          node "${asarCandidates[0]}" list "$appAsar" > "$RUNNER_TEMP/linux-asar-entries.txt"
+          grep -F -x '/dist/server/builtin-skills/imagegen.js' "$RUNNER_TEMP/linux-asar-entries.txt"
+
+          appImages=(dist-electron/jyaiwork-linux-x86_64-*.AppImage)
+          debs=(dist-electron/jyaiwork-linux-amd64-*.deb)
+          if [ ${#appImages[@]} -ne 1 ] || [ ${#debs[@]} -ne 1 ]; then
+            echo "Expected exactly one Linux x64 AppImage and one DEB" >&2
+            exit 1
+          fi
+          test "$(dpkg-deb --field "${debs[0]}" Architecture)" = amd64
+          file "${appImages[0]}" | grep 'ELF 64-bit.*x86-64'
+          sha256sum "${appImages[0]}" "${debs[0]}"
+
+      - name: Upload installers directly to draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+          RELEASE_REPOSITORY: SimonChenX/jyaiwork-release
+          STAGING_TAG: ${{ needs.prepare-release.outputs.staging_tag }}
+          INSTALLER_PATTERN: ${{ matrix.artifact_path }}
+          EXPECTED_INSTALLERS: ${{ matrix.installer_count }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installers=($INSTALLER_PATTERN)
+          if [ ${#installers[@]} -ne "$EXPECTED_INSTALLERS" ]; then
+            echo "::error::Expected $EXPECTED_INSTALLERS installers for $INSTALLER_PATTERN"
+            exit 1
+          fi
+          gh release upload "$STAGING_TAG" "${installers[@]}" \
+            --repo "$RELEASE_REPOSITORY" --clobber
+
+  publish-release:
+    name: Publish public desktop release
+    needs:
+      - prepare-release
+      - build-desktop
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: publish-jyaiwork-desktop-${{ needs.prepare-release.outputs.version }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Download verified installers from draft release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+          RELEASE_REPOSITORY: SimonChenX/jyaiwork-release
+          STAGING_TAG: ${{ needs.prepare-release.outputs.staging_tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$STAGING_TAG" \
+            --repo "$RELEASE_REPOSITORY" \
+            --pattern 'jyaiwork-*' \
+            --dir release-assets
+
+      - name: Publish installers and checksums
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+          RELEASE_REPOSITORY: SimonChenX/jyaiwork-release
+          RELEASE_TARGET_BRANCH: ${{ needs.prepare-release.outputs.target_branch }}
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+          BUILD_PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          windowsInstallers=(release-assets/jyaiwork-win-x64-*.exe)
+          macInstallers=(release-assets/jyaiwork-mac-arm64-*.dmg)
+          macX64Installers=(release-assets/jyaiwork-mac-x64-*.dmg)
+          linuxAppImages=(release-assets/jyaiwork-linux-x86_64-*.AppImage)
+          linuxDebs=(release-assets/jyaiwork-linux-amd64-*.deb)
+          expectedMacX64Installers=0
+          expectedLinuxInstallers=0
+
+          case "$BUILD_PLATFORM" in
+            all)
+              expectedWindowsInstallers=1
+              expectedMacInstallers=1
+              expectedMacX64Installers=1
+              expectedLinuxInstallers=1
+              ;;
+            win-mac)
+              expectedWindowsInstallers=1
+              expectedMacInstallers=1
+              ;;
+            windows)
+              expectedWindowsInstallers=1
+              expectedMacInstallers=0
+              ;;
+            macos)
+              expectedWindowsInstallers=0
+              expectedMacInstallers=1
+              ;;
+            macos-x64)
+              expectedWindowsInstallers=0
+              expectedMacInstallers=0
+              expectedMacX64Installers=1
+              ;;
+            linux)
+              expectedWindowsInstallers=0
+              expectedMacInstallers=0
+              expectedLinuxInstallers=1
+              ;;
+            *)
+              echo "::error::Unsupported desktop platform: $BUILD_PLATFORM"
+              exit 1
+              ;;
+          esac
+
+          if [ ${#windowsInstallers[@]} -ne "$expectedWindowsInstallers" ] || \
+            [ ${#macInstallers[@]} -ne "$expectedMacInstallers" ] || \
+            [ ${#macX64Installers[@]} -ne "$expectedMacX64Installers" ] || \
+            [ ${#linuxAppImages[@]} -ne "$expectedLinuxInstallers" ] || \
+            [ ${#linuxDebs[@]} -ne "$expectedLinuxInstallers" ]; then
+            echo "::error::Installer artifacts do not match the requested platform: $BUILD_PLATFORM"
+            exit 1
+          fi
+
+          windowsInstaller="release-assets/jyaiwork-win-x64-$RELEASE_VERSION.exe"
+          macInstaller="release-assets/jyaiwork-mac-arm64-$RELEASE_VERSION.dmg"
+          macX64Installer="release-assets/jyaiwork-mac-x64-$RELEASE_VERSION.dmg"
+          linuxAppImage="release-assets/jyaiwork-linux-x86_64-$RELEASE_VERSION.AppImage"
+          linuxDeb="release-assets/jyaiwork-linux-amd64-$RELEASE_VERSION.deb"
+          builtInstallers=()
+
+          if [ "$expectedWindowsInstallers" -eq 1 ]; then
+            if [ ! -f "$windowsInstaller" ]; then
+              echo "::error::Windows installer filename does not match desktop version $RELEASE_VERSION"
+              exit 1
+            fi
+            builtInstallers+=("$windowsInstaller")
+          fi
+
+          if [ "$expectedMacInstallers" -eq 1 ]; then
+            if [ ! -f "$macInstaller" ]; then
+              echo "::error::macOS installer filename does not match desktop version $RELEASE_VERSION"
+              exit 1
+            fi
+            builtInstallers+=("$macInstaller")
+          fi
+
+          if [ "$expectedMacX64Installers" -eq 1 ]; then
+            if [ ! -f "$macX64Installer" ]; then
+              echo "::error::macOS x64 installer filename does not match desktop version $RELEASE_VERSION"
+              exit 1
+            fi
+            builtInstallers+=("$macX64Installer")
+          fi
+
+          if [ "$expectedLinuxInstallers" -eq 1 ]; then
+            if [ ! -f "$linuxAppImage" ] || [ ! -f "$linuxDeb" ]; then
+              echo "::error::Linux installer filenames do not match desktop version $RELEASE_VERSION"
+              exit 1
+            fi
+            builtInstallers+=("$linuxAppImage" "$linuxDeb")
+          fi
+
+          releaseTag="v$RELEASE_VERSION"
+          releaseTimestamp="$(TZ=Asia/Shanghai date '+%Y%m%d%H%M%S')"
+          releaseExists=false
+
+          if existingAssets="$(gh release view "$releaseTag" \
+            --repo "$RELEASE_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name' 2>/dev/null)"; then
+            releaseExists=true
+            for installerName in \
+              "$(basename "$windowsInstaller")" \
+              "$(basename "$macInstaller")" \
+              "$(basename "$macX64Installer")" \
+              "$(basename "$linuxAppImage")" \
+              "$(basename "$linuxDeb")"; do
+              if [ ! -f "release-assets/$installerName" ] && \
+                printf '%s\n' "$existingAssets" | grep -F -x "$installerName" >/dev/null; then
+                gh release download "$releaseTag" \
+                  --repo "$RELEASE_REPOSITORY" \
+                  --pattern "$installerName" \
+                  --dir release-assets
+              fi
+            done
+          fi
+
+          releaseInstallerNames=()
+          for installer in "$windowsInstaller" "$macInstaller" "$macX64Installer" "$linuxAppImage" "$linuxDeb"; do
+            if [ -f "$installer" ]; then
+              releaseInstallerNames+=("$(basename "$installer")")
+            fi
+          done
+
+          (
+            cd release-assets
+            sha256sum "${releaseInstallerNames[@]}" > SHA256SUMS
+          )
+
+          releaseNotesFile="release-notes.md"
+          {
+            # 更新内容：取 CHANGELOG.md 中当前版本的段落（版本号取自 package.json）
+            if [ -f CHANGELOG.md ]; then
+              changelogSection="$(awk -v ver="$RELEASE_VERSION" '
+                $0 ~ "^## \\[" ver "\\]" { capture = 1; next }
+                capture && /^## / { exit }
+                capture { print }
+              ' CHANGELOG.md)"
+              if [ -n "$changelogSection" ]; then
+                printf '## 更新内容（%s）\n%s\n\n' "$RELEASE_VERSION" "$changelogSection"
+              else
+                printf '> 本版本 %s 未在 CHANGELOG.md 中登记更新内容。\n\n' "$RELEASE_VERSION"
+              fi
+            fi
+            printf '## 安装包\n\n'
+            if [ -f "$windowsInstaller" ]; then
+              printf '%s\n' '- Windows：x64 安装程序。'
+            fi
+            if [ -f "$macInstaller" ]; then
+              printf '%s\n' '- macOS：Apple Silicon（arm64）安装程序。'
+            fi
+            if [ -f "$macX64Installer" ]; then
+              printf '%s\n' '- macOS：Intel（x64）安装程序。'
+            fi
+            if [ -f "$linuxAppImage" ] || [ -f "$linuxDeb" ]; then
+              printf '%s\n' '- Linux：x64 AppImage 和 DEB 安装程序。'
+            fi
+            if [ -f "$macInstaller" ] || [ -f "$macX64Installer" ]; then
+              printf '\n'
+              cat <<'RELEASE_NOTES'
+          ## macOS 未签名应用处理
+
+          安装后如遇到应用无法打开，请先将 JYAIWork 拖入「应用程序」，再执行：
+
+          ```bash
+          sudo xattr -cr /Applications/JYAIWork.app
+          ```
+
+          执行完成后重新打开 JYAIWork。
+          RELEASE_NOTES
+            fi
+          } > "$releaseNotesFile"
+
+          if [ "$releaseExists" = true ]; then
+            gh release upload "$releaseTag" \
+              "${builtInstallers[@]}" \
+              release-assets/SHA256SUMS \
+              --repo "$RELEASE_REPOSITORY" \
+              --clobber
+            gh release edit "$releaseTag" \
+              --repo "$RELEASE_REPOSITORY" \
+              --title "JYAIWork $releaseTag.$releaseTimestamp" \
+              --notes-file "$releaseNotesFile"
+          else
+            gh release create "$releaseTag" \
+              "${builtInstallers[@]}" \
+              release-assets/SHA256SUMS \
+              --repo "$RELEASE_REPOSITORY" \
+              --target "$RELEASE_TARGET_BRANCH" \
+              --title "JYAIWork $releaseTag.$releaseTimestamp" \
+              --notes-file "$releaseNotesFile"
+          fi
+
+      - name: Mirror installers to source repository release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+          SOURCE_REPOSITORY: SimonChenX/JYAI_WorK_Client
+          RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          tag="v$RELEASE_VERSION"
+          releaseTimestamp="$(TZ=Asia/Shanghai date '+%Y%m%d%H%M%S')"
+          assets=()
+          for candidate in release-assets/*.exe release-assets/*.dmg release-assets/*.AppImage \
+            release-assets/*.deb release-assets/SHA256SUMS; do
+            [ -f "$candidate" ] && assets+=("$candidate")
+          done
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "::error::No installers available to mirror to $SOURCE_REPOSITORY"
+            exit 1
+          fi
+          printf '镜像 %d 个资产到 %s 的 %s\n' "${#assets[@]}" "$SOURCE_REPOSITORY" "$tag"
+          if gh release view "$tag" --repo "$SOURCE_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --repo "$SOURCE_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$SOURCE_REPOSITORY" \
+              --title "JYAIWork $tag.$releaseTimestamp" \
+              --notes-file release-notes.md
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --repo "$SOURCE_REPOSITORY" \
+              --target "$SOURCE_REF" \
+              --title "JYAIWork $tag.$releaseTimestamp" \
+              --notes-file release-notes.md
+          fi
+
+      - name: Remove temporary draft after successful publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+          RELEASE_REPOSITORY: SimonChenX/jyaiwork-release
+          STAGING_TAG: ${{ needs.prepare-release.outputs.staging_tag }}
+        run: gh release delete "$STAGING_TAG" --repo "$RELEASE_REPOSITORY" --yes
