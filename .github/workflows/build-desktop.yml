@@ -13,10 +13,10 @@ on:
   workflow_dispatch:
     inputs:
       platform:
-        description: Desktop installer platform (default win-mac = Windows x64 + macOS arm64; others on demand)
+        description: Desktop installer platform (default all = Windows x64 + macOS arm64 + macOS x64 + Linux)
         required: true
         type: choice
-        default: win-mac
+        default: all
         options:
           - win-mac
           - all
@@ -152,8 +152,8 @@ jobs:
           };
 
           const platform = process.env.BUILD_PLATFORM;
-          // win-mac = 日常自动发版口径：只打 Windows x64 与 macOS arm64（省 GitHub Actions 额度）；
-          // macos-x64 / linux / all 仍可手动选，用于按需补包。
+          // all = 默认全量（5 个安装包）；win-mac = 只打 Windows x64 与 macOS arm64 的快速口径
+          // （私有仓兜底路径额度紧张时用它）；其余单平台值用于按需补包。
           const presets = { all: Object.keys(targets), "win-mac": ["windows", "macos"] };
           const include = (presets[platform] ?? [platform]).map((key) => targets[key]);
           if (include.some((target) => !target)) {
