@@ -52,6 +52,7 @@ jobs:
       target_branch: ${{ steps.metadata.outputs.target_branch }}
       matrix: ${{ steps.targets.outputs.matrix }}
       staging_tag: ${{ steps.staging.outputs.tag }}
+      changelog_section: ${{ steps.notes.outputs.section }}
 
     steps:
       - name: Checkout source repository
@@ -102,6 +103,42 @@ jobs:
 
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
           printf 'target_branch=%s\n' "$targetBranch" >> "$GITHUB_OUTPUT"
+
+      - name: Extract changelog section for release notes
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 版本号与构建源码同源：契约是「package.json 的 version」，
+          # 段落取 CHANGELOG.md 里 `## [<version>]` 开头、到下一个 `## ` 之前。
+          # 这一步只能放在 prepare-release：只有这个作业 checkout 了源码仓；
+          # publish-release 的工作区里只有安装包产物，没有 CHANGELOG.md
+          # （0.0.24/0.0.25/0.0.26 的 Release 说明缺「更新内容」段就是这个原因）。
+          version="$(node -p "require('./package.json').version")"
+          if [ ! -f CHANGELOG.md ]; then
+            echo "::warning::checked-out source has no CHANGELOG.md; release notes will omit the changelog section."
+            printf 'section=\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          section="$(awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { capture = 1; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' CHANGELOG.md)"
+          # 去掉首尾空行，段内空行保留
+          section="$(printf '%s\n' "$section" | awk '{ lines[NR] = $0 } END { first = 0; last = 0; for (i = 1; i <= NR; i++) if (lines[i] ~ /[^[:space:]]/) { if (!first) first = i; last = i } for (i = first; i <= last; i++) print lines[i] }')"
+          if [ -z "$section" ]; then
+            echo "::warning::version $version has no section in CHANGELOG.md."
+            printf 'section=\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo 'section<<JYAI_CHANGELOG_EOF'
+            printf '%s\n' "$section"
+            echo 'JYAI_CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+          printf 'CHANGELOG 段落已抽出：%s 行\n' "$(printf '%s\n' "$section" | wc -l)"
 
       - name: Select desktop build targets
         id: targets
@@ -458,6 +495,7 @@ jobs:
           RELEASE_REPOSITORY: SimonChenX/jyaiwork-release
           RELEASE_TARGET_BRANCH: ${{ needs.prepare-release.outputs.target_branch }}
           RELEASE_VERSION: ${{ needs.prepare-release.outputs.version }}
+          RELEASE_CHANGELOG: ${{ needs.prepare-release.outputs.changelog_section }}
           BUILD_PLATFORM: ${{ inputs.platform }}
         run: |
           set -euo pipefail
@@ -593,18 +631,12 @@ jobs:
 
           releaseNotesFile="release-notes.md"
           {
-            # 更新内容：取 CHANGELOG.md 中当前版本的段落（版本号取自 package.json）
-            if [ -f CHANGELOG.md ]; then
-              changelogSection="$(awk -v ver="$RELEASE_VERSION" '
-                $0 ~ "^## \\[" ver "\\]" { capture = 1; next }
-                capture && /^## / { exit }
-                capture { print }
-              ' CHANGELOG.md)"
-              if [ -n "$changelogSection" ]; then
-                printf '## 更新内容（%s）\n%s\n\n' "$RELEASE_VERSION" "$changelogSection"
-              else
-                printf '> 本版本 %s 未在 CHANGELOG.md 中登记更新内容。\n\n' "$RELEASE_VERSION"
-              fi
+            # 更新内容：段落由 prepare-release 从源码仓的 CHANGELOG.md 抽出，
+            # 经 job output 传进来；本作业的工作区里没有 CHANGELOG.md，不能自己读文件。
+            if [ -n "${RELEASE_CHANGELOG:-}" ]; then
+              printf '## 更新内容（%s）\n%s\n\n' "$RELEASE_VERSION" "$RELEASE_CHANGELOG"
+            else
+              printf '> 本版本 %s 未在 CHANGELOG.md 中登记更新内容。\n\n' "$RELEASE_VERSION"
             fi
             printf '## 安装包\n\n'
             if [ -f "$windowsInstaller" ]; then
@@ -727,3 +759,4 @@ jobs:
           RELEASE_REPOSITORY: SimonChenX/jyaiwork-release
           STAGING_TAG: ${{ needs.prepare-release.outputs.staging_tag }}
         run: gh release delete "$STAGING_TAG" --repo "$RELEASE_REPOSITORY" --yes
+
